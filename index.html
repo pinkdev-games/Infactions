@@ -548,8 +548,8 @@ function updateBody() {
   body.position.set(headPos.x, 0, headPos.z);
   body.rotation.y = yaw;
   bodyHead.position.y = headPos.y;
-  bodyTorso.position.y = headPos.y - 0.45;
-  bodyLegs.position.y = headPos.y - 0.95;
+  bodyTorso.position.y = headPos.y - 0.35;
+  bodyLegs.position.y = headPos.y - 0.7;
   // keep the torso a little behind your head so it is not in your face
   bodyTorso.position.z = 0.12;
   bodyLegs.position.z = 0.12;
@@ -569,7 +569,7 @@ for (let i = 0; i < 2; i++) {
     new THREE.BoxGeometry(0.12, 0.12, 0.12),
     new THREE.MeshLambertMaterial({ map: skinTexture('hand') })
   );
-  tip.position.z = -0.04;
+  tip.position.set(0, -0.25, -0.35);
   c.add(tip);
   c.addEventListener('selectstart', () => { c.userData.pressed = true; });
   c.addEventListener('selectend', () => { c.userData.pressed = false; c.userData.target = null; });
@@ -650,8 +650,10 @@ const HAND_RADIUS = 0.14;
 const PUSH_BOOST = 1.15;
 const AIR_DRAG = 0.4;
 const MAX_SPEED = 10;
-const BODY_HEIGHT = 1.25;     // metres from your head down to your feet, sitting or standing
-const BODY_RADIUS = 0.2;      // how wide your body is
+const BODY_HEIGHT = 0.8;      // how tall your body column is, measured down from your head
+const BODY_RADIUS = 0.15;     // how wide your body is
+const ARM_REACH = 0.35;       // your hands act this far beyond the controller, pointing where it points
+const ARM_DROP = 0.25;        // and this much lower, so hands can reach below your body
 const prevHand = [new THREE.Vector3(), new THREE.Vector3()];
 const handWorld = new THREE.Vector3();
 
@@ -676,7 +678,12 @@ function updateMovement(dt) {
   const shove = new THREE.Vector3();
   for (let i = 0; i < 2; i++) {
     if (!controllers[i].userData.connected) { handReady[i] = false; continue; }
+    // the hand's reach point: out along the controller and a bit downward
     controllers[i].getWorldPosition(handWorld);
+    controllers[i].getWorldQuaternion(tmpQ);
+    fwd.set(0, 0, -1).applyQuaternion(tmpQ);
+    handWorld.addScaledVector(fwd, ARM_REACH);
+    handWorld.y -= ARM_DROP;
     if (handReady[i]) {
       const R = HAND_RADIUS;
       const probes = [[0,0,0],[R,0,0],[-R,0,0],[0,R,0],[0,-R,0],[0,0,R],[0,0,-R]];
