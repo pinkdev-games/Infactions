@@ -503,7 +503,9 @@ startPosition();
 const controllers = [];
 for (let i = 0; i < 2; i++) {
   const c = renderer.xr.getController(i);
-  c.userData = { pressed: false, target: null };
+  c.userData = { pressed: false, target: null, connected: false };
+  c.addEventListener('connected', () => { c.userData.connected = true; });
+  c.addEventListener('disconnected', () => { c.userData.connected = false; c.userData.pressed = false; handReady[i] = false; });
   const tip = new THREE.Mesh(
     new THREE.BoxGeometry(0.06, 0.06, 0.16),
     new THREE.MeshBasicMaterial({ color: i === 0 ? 0xffeb3b : 0x4dd0e1 })
@@ -540,7 +542,7 @@ function updateBreaking(dt) {
   let showing = false;
   for (const c of controllers) {
     const u = c.userData;
-    if (!u.pressed) continue;
+    if (!u.connected || !u.pressed) continue;
     c.getWorldPosition(tmp);
     c.getWorldQuaternion(tmpQ);
     fwd.set(0, 0, -1).applyQuaternion(tmpQ);
@@ -614,6 +616,7 @@ function pushOutDirection(p) {
 function updateMovement(dt) {
   const shove = new THREE.Vector3();
   for (let i = 0; i < 2; i++) {
+    if (!controllers[i].userData.connected) { handReady[i] = false; continue; }
     controllers[i].getWorldPosition(handWorld);
     if (handReady[i]) {
       const R = HAND_RADIUS;
