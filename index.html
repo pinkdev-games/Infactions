@@ -498,19 +498,78 @@ function startPosition() {
 startPosition();
 
 // =====================================================
+// STEVE-STYLE SKIN (drawn by the game, no image files)
+// =====================================================
+function skinTexture(part) {
+  const c = document.createElement('canvas');
+  c.width = c.height = 16;
+  const g = c.getContext('2d');
+  const skin = '#c68a5e', hair = '#4a2f1a', shirt = '#2aa6a0', pants = '#3b3f9c';
+  if (part === 'hand') {
+    g.fillStyle = skin; g.fillRect(0, 0, 16, 16);
+    g.fillStyle = '#b57a4f';
+    for (let i = 0; i < 10; i++) g.fillRect((i * 7) % 16, (i * 5) % 16, 2, 2);
+  } else if (part === 'head') {
+    g.fillStyle = skin; g.fillRect(0, 0, 16, 16);
+    g.fillStyle = hair; g.fillRect(0, 0, 16, 5);
+    g.fillStyle = '#ffffff'; g.fillRect(3, 7, 3, 2); g.fillRect(10, 7, 3, 2);
+    g.fillStyle = '#3a5fcd'; g.fillRect(4, 7, 2, 2); g.fillRect(10, 7, 2, 2);
+    g.fillStyle = '#7a4a2a'; g.fillRect(5, 11, 6, 2);
+  } else if (part === 'torso') {
+    g.fillStyle = shirt; g.fillRect(0, 0, 16, 16);
+    g.fillStyle = '#23908b';
+    for (let i = 0; i < 12; i++) g.fillRect((i * 5) % 16, (i * 3) % 16, 2, 2);
+  } else {
+    g.fillStyle = pants; g.fillRect(0, 0, 16, 16);
+    g.fillStyle = '#2f337f';
+    for (let i = 0; i < 12; i++) g.fillRect((i * 3) % 16, (i * 7) % 16, 2, 2);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.magFilter = THREE.NearestFilter;
+  t.minFilter = THREE.NearestFilter;
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+// A blocky body that follows your head. You only see it in the mirror of your own hands,
+// so it is mostly there for looks and for other people later.
+const headPos = new THREE.Vector3();
+const body = new THREE.Group();
+const bodyHead = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.3, 0.3), new THREE.MeshLambertMaterial({ map: skinTexture('head') }));
+const bodyTorso = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.6, 0.2), new THREE.MeshLambertMaterial({ map: skinTexture('torso') }));
+const bodyLegs = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.6, 0.2), new THREE.MeshLambertMaterial({ map: skinTexture('legs') }));
+bodyHead.visible = false;   // hide your own head so it does not block your view
+body.add(bodyHead, bodyTorso, bodyLegs);
+scene.add(body);
+
+function updateBody() {
+  camera.getWorldPosition(headPos);
+  const yaw = new THREE.Euler().setFromQuaternion(camera.getWorldQuaternion(new THREE.Quaternion()), 'YXZ').y;
+  body.position.set(headPos.x, 0, headPos.z);
+  body.rotation.y = yaw;
+  bodyHead.position.y = headPos.y;
+  bodyTorso.position.y = headPos.y - 0.45;
+  bodyLegs.position.y = headPos.y - 0.95;
+  // keep the torso a little behind your head so it is not in your face
+  bodyTorso.position.z = 0.12;
+  bodyLegs.position.z = 0.12;
+}
+
+// =====================================================
 // CONTROLLERS
 // =====================================================
 const controllers = [];
+const handReady = [false, false];
 for (let i = 0; i < 2; i++) {
   const c = renderer.xr.getController(i);
   c.userData = { pressed: false, target: null, connected: false };
   c.addEventListener('connected', () => { c.userData.connected = true; });
   c.addEventListener('disconnected', () => { c.userData.connected = false; c.userData.pressed = false; handReady[i] = false; });
   const tip = new THREE.Mesh(
-    new THREE.BoxGeometry(0.06, 0.06, 0.16),
-    new THREE.MeshBasicMaterial({ color: i === 0 ? 0xffeb3b : 0x4dd0e1 })
+    new THREE.BoxGeometry(0.12, 0.12, 0.12),
+    new THREE.MeshLambertMaterial({ map: skinTexture('hand') })
   );
-  tip.position.z = -0.08;
+  tip.position.z = -0.04;
   c.add(tip);
   c.addEventListener('selectstart', () => { c.userData.pressed = true; });
   c.addEventListener('selectend', () => { c.userData.pressed = false; c.userData.target = null; });
@@ -587,14 +646,14 @@ function updateBreaking(dt) {
 // GORILLA TAG MOVEMENT (hands collide with blocks)
 // =====================================================
 const GRAVITY = -9.8;
-const HAND_RADIUS = 0.08;
+const HAND_RADIUS = 0.14;
 const PUSH_BOOST = 1.15;
 const AIR_DRAG = 0.4;
 const MAX_SPEED = 10;
+const BODY_HEIGHT = 1.25;     // metres from your head down to your feet, sitting or standing
+const BODY_RADIUS = 0.2;      // how wide your body is
 const prevHand = [new THREE.Vector3(), new THREE.Vector3()];
-const handReady = [false, false];
 const handWorld = new THREE.Vector3();
-const headPos = new THREE.Vector3();
 
 function solidAt(p) {
   const id = getBlock(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z));
@@ -643,15 +702,38 @@ function updateMovement(dt) {
   velocity.multiplyScalar(1 - AIR_DRAG * dt);
   if (velocity.length() > MAX_SPEED) velocity.setLength(MAX_SPEED);
 
+  // The body is a column hanging from your head. Its height follows your head,
+  // so sitting or standing both work. Feet are always a little above the floor.
   // move one axis at a time so you slide along walls and land on floors
   for (const axis of ['x', 'y', 'z']) {
     const step = velocity[axis] * dt;
     rig.position[axis] += step;
     camera.getWorldPosition(headPos);
-    const checks = [headPos.clone(), headPos.clone().setY(headPos.y - 0.6), headPos.clone().setY(headPos.y - 1.3)];
+    const feetY = Math.max(headPos.y - BODY_HEIGHT, headPos.y - 1.7);
+    const checks = [
+      headPos.clone().setY(headPos.y + 0.1),
+      headPos.clone().setY(headPos.y - 0.4),
+      headPos.clone().setY((headPos.y + feetY) / 2),
+      headPos.clone().setY(feetY)
+    ];
+    const R = BODY_RADIUS;
     let hit = false;
-    for (const p of checks) if (solidAt(p)) { hit = true; break; }
+    for (const base of checks) {
+      for (const o of [[0,0],[R,0],[-R,0],[0,R],[0,-R]]) {
+        const p = base.clone(); p.x += o[0]; p.z += o[1];
+        if (solidAt(p)) { hit = true; break; }
+      }
+      if (hit) break;
+    }
     if (hit) { rig.position[axis] -= step; velocity[axis] = 0; }
+  }
+
+  // Floor snap: if your feet are inside the ground, lift the rig up so you stand on it
+  camera.getWorldPosition(headPos);
+  const feet = new THREE.Vector3(headPos.x, headPos.y - BODY_HEIGHT, headPos.z);
+  if (solidAt(feet)) {
+    rig.position.y = Math.floor(feet.y) + 1 - (headPos.y - BODY_HEIGHT - rig.position.y);
+    if (velocity.y < 0) velocity.y = 0;
   }
 
   // world edge: an invisible wall at 5,000 blocks
@@ -675,6 +757,7 @@ renderer.setAnimationLoop(() => {
   last = now;
   updateChunks();
   updateMovement(dt);
+  updateBody();
   updateBreaking(dt);
   renderer.render(scene, camera);
 });
