@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VR Voxel Game (Beta)</title>
+<style>body{margin:0;overflow:hidden;background:#87ceeb}</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+// =====================================================
+// SETTINGS
+// =====================================================
+const BLOCK = 1;              // one block = 1 metre
+const CHUNK = 16;             // chunk is 16 x 16 columns
+const WORLD_LIMIT = 5000;     // map runs from -5000 to +5000 on x and z
+const MAX_H = 48;             // build height
+const SEA = 9;                // sea level
+const VIEW_CHUNKS = 3;        // how many chunks around you stay loaded
+const SEED = 1337;
+
+// =====================================================
+// SCENE
+// =====================================================
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.Fog(0x87ceeb, 30, CHUNK * VIEW_CHUNKS);
+
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 300);
+const rig = new THREE.Group();
+rig.add(camera);
+scene.add(rig);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x556677, 1.15));
+const sun = new THREE.DirectionalLight(0xffffff, 0.7);
+sun.position.set(30, 60, 20);
+scene.add(sun);
+
+// =====================================================
+// BLOCK TYPES + GENERATED TEXTURES
+// =====================================================
+// Each type: base colour, speckle colour, hit points, and whether it is unbreakable
+const TYPES = {
+  grass:   { base: '#4fa83d', spot: '#3d8a2e', hp: 1.0 },
+  dirt:    { base: '#8b6b4a', spot: '#6f5238', hp: 1.0 },
+  stone:   { base: '#8e8e8e', spot: '#6e6e6e', hp: 2.5 },
+  sand:    { base: '#e3d59b', spot: '#cdbd80', hp: 0.8 },
+  water:   { base: '#3a6fd8', spot: '#2f5cc0', hp: 0.5 },
+  wood:    { base: '#7a5230', spot: '#5e3d22', hp: 1.6 },
+  leaf:    { base: '#2f7d32', spot: '#1f5f24', hp: 0.5 },
+  plank:   { base: '#b88a54', spot: '#9c7243', hp: 1.4 },
+  brick:   { base: '#a8483a', spot: '#822f25', hp: 2.8 },
+  cobble:  { base: '#7b7b7b', spot: '#555555', hp: 2.6 },
+  snow:    { base: '#f2f6fa', spot: '#d5dde6', hp: 0.7 },
+  glass:   { base: '#bfe6f2', spot: '#9ccfe0', hp: 0.4 },
+  gold:    { base: '#e8c33a', spot: '#c29a1c', hp: 3.0 },
+  platform:{ base: '#2b2b33', spot: '#3a3a45', hp: 1e9, unbreakable: true }
+};
+
+function makeTexture(base, spot) {
+  const c = document.createElement('canvas');
+  c.width = c.height = 16;
+  const g = c.getContext('2d');
+  g.fillStyle = base;
+  g.fillRect(0, 0, 16, 16);
+  g.fillStyle = spot;
+  let s = 7;
+  for (let i = 0; i < 40; i++) {
+    s = (s * 9301 + 49297) % 233280;
+    const x = Math.floor((s / 233280) * 16);
+    s = (s * 9301 + 49297) % 233280;
+    const y = Math.floor((s / 233280) * 16);
+    g.fillRect(x, y, 2, 2);
+  }
+  g.strokeStyle = 'rgba(0,0,0,0.25)';
+  g.strokeRect(0.5, 0.5, 15, 15);
+  const t = new THREE.CanvasTexture(c);
+  t.magFilter = THREE.NearestFilter;
+  t.minFilter = THREE.NearestFilter;
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+const ID = {};              // name -> numeric id
+const NAMES = [null];       // numeric id -> name
+const mats = [null];
+for (const name in TYPES) {
+  ID[name] = NAMES.length;
+  NAMES.push(name);
+  const t = TYPES[name];
+  mats.push(new THREE.MeshLambertMaterial({
+    map: makeTexture(t.base, t.spot),
+    transparent: name === 'glass' || name === 'water',
+    opacity: name === 'glass' ? 0.55 : (name === 'water' ? 0.75 : 1)
+  }));
+}
+
+// =====================================================
+// NOISE
+// =====================================================
+function hash2(x, z) {
+  const s = Math.sin(x * 127.1 + z * 311.7 + SEED * 74.7) * 43758.5453;
+  return s - Math.floor(s);
+}
+const smooth = t => t * t * (3 - 2 * t);
+function noise(x, z) {
+  const xi = Math.floor(x), zi = Math.floor(z);
+  const xf = smooth(x - xi), zf = smooth(z - zi);
+  const a = hash2(xi, zi), b = hash2(xi + 1, zi);
+  const c = hash2(xi, zi + 1), d = hash2(xi + 1, zi + 1);
+  return a + (b - a) * xf + (c - a) * zf + (a - b - c + d) * xf * zf;
+}
+function heightAt(x, z) {
+  const n = noise(x / 60, z / 60) * 0.55 + noise(x / 22, z / 22) * 0.3 + noise(x / 8, z / 8) * 0.15;
+  return Math.floor(4 + n * 22);
+}
+
+// =====================================================
+// WORLD STORAGE (chunks)
+// =====================================================
+const chunks = new Map();   // 'cx,cz' -> { data, mesh, dirty }
+const cKey = (cx, cz) => cx + ',' + cz;
+const inWorld = (x, z) => x >= -WORLD_LIMIT && x <= WORLD_LIMIT && z >= -WORLD_LIMIT && z <= WORLD_LIMIT;
+
+function getChunk(cx, cz) {
+  return chunks.get(cKey(cx, cz));
+}
+
+function getBlock(x, y, z) {
+  if (y < 0 || y >= MAX_H) return 0;
+  if (!inWorld(x, z)) return 0;
+  const cx = Math.floor(x / CHUNK), cz = Math.floor(z / CHUNK);
+  const ch = getChunk(cx, cz);
+  if (!ch) return 0;
+  const lx = x - cx * CHUNK, lz = z - cz * CHUNK;
+  return ch.data[(y * CHUNK + lz) * CHUNK + lx];
+}
+
+function setBlockRaw(ch, cx, cz, x, y, z, id) {
+  if (y < 0 || y >= MAX_H || !inWorld(x, z)) return;
+  if (Math.floor(x / CHUNK) !== cx || Math.floor(z / CHUNK) !== cz) return;
+  ch.data[(y * CHUNK + (z - cz * CHUNK)) * CHUNK + (x - cx * CHUNK)] = id;
+}
+
+function setBlock(x, y, z, id) {
+  if (y < 0 || y >= MAX_H || !inWorld(x, z)) return;
+  const cx = Math.floor(x / CHUNK), cz = Math.floor(z / CHUNK);
+  const ch = getChunk(cx, cz);
+  if (!ch) return;
+  ch.data[(y * CHUNK + (z - cz * CHUNK)) * CHUNK + (x - cx * CHUNK)] = id;
+  ch.dirty = true;
+  // neighbours need a rebuild when we edit a chunk edge
+  const lx = x - cx * CHUNK, lz = z - cz * CHUNK;
+  if (lx === 0) markDirty(cx - 1, cz);
+  if (lx === CHUNK - 1) markDirty(cx + 1, cz);
+  if (lz === 0) markDirty(cx, cz - 1);
+  if (lz === CHUNK - 1) markDirty(cx, cz + 1);
+}
+function markDirty(cx, cz) {
+  const c = getChunk(cx, cz);
+  if (c) c.dirty = true;
+}
+
+// =====================================================
+// STRUCTURES (deterministic, so chunks agree with each other)
+// =====================================================
+// The world is split into 64 x 64 "cells". Each cell may hold one village, one temple, and some trees.
+const CELL = 64;
+
+function cellInfo(cellX, cellZ) {
+  const r1 = hash2(cellX * 91 + 5, cellZ * 57 + 11);
+  const r2 = hash2(cellX * 37 + 101, cellZ * 73 + 3);
+  const r3 = hash2(cellX * 13 + 77, cellZ * 29 + 41);
+  const info = { village: null, temple: null };
+  const ox = cellX * CELL, oz = cellZ * CELL;
+  if (r1 > 0.72) info.village = { x: ox + 16 + Math.floor(r2 * 32), z: oz + 16 + Math.floor(r3 * 32) };
+  if (r2 > 0.9)  info.temple  = { x: ox + 20 + Math.floor(r3 * 24), z: oz + 20 + Math.floor(r1 * 24) };
+  return info;
+}
+
+// Place a block only if it falls inside the chunk being generated
+function put(ch, cx, cz, x, y, z, name) {
+  setBlockRaw(ch, cx, cz, x, y, z, ID[name]);
+}
+
+function buildHouse(ch, cx, cz, x0, z0, w, d, h, y0) {
+  for (let x = x0; x < x0 + w; x++) {
+    for (let z = z0; z < z0 + d; z++) {
+      // clear space + floor
+      put(ch, cx, cz, x, y0 - 1, z, 'cobble');
+      for (let y = 0; y < h + 1; y++) put(ch, cx, cz, x, y0 + y, z, null === 1 ? 'plank' : 'plank');
+    }
+  }
+  for (let x = x0; x < x0 + w; x++) {
+    for (let z = z0; z < z0 + d; z++) {
+      const wall = x === x0 || x === x0 + w - 1 || z === z0 || z === z0 + d - 1;
+      for (let y = 0; y < h; y++) {
+        let id = 0;
+        if (wall) {
+          id = ID.plank;
+          // corners are logs
+          if ((x === x0 || x === x0 + w - 1) && (z === z0 || z === z0 + d - 1)) id = ID.wood;
+          // door in the middle of the front wall
+          if (z === z0 && x === x0 + Math.floor(w / 2) && y < 2) id = 0;
+          // windows
+          if (y === 1 && !((x === x0 || x === x0 + w - 1) && (z === z0 || z === z0 + d - 1))
+              && ((z === z0 + d - 1 && x === x0 + 1) || (x === x0 && z === z0 + 1))) id = ID.glass;
+        }
+        setBlockRaw(ch, cx, cz, x, y0 + y, z, id);
+      }
+      // roof
+      setBlockRaw(ch, cx, cz, x, y0 + h, z, ID.brick);
+    }
+  }
+}
+
+function buildVillage(ch, cx, cz, vx, vz) {
+  const y0 = heightAt(vx, vz) + 1;
+  // a gold well in the middle
+  for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) {
+    put(ch, cx, cz, vx + dx, y0 - 1, vz + dz, 'cobble');
+    if (Math.abs(dx) === 1 || Math.abs(dz) === 1) put(ch, cx, cz, vx + dx, y0, vz + dz, 'cobble');
+    else put(ch, cx, cz, vx + dx, y0, vz + dz, 'water');
+  }
+  put(ch, cx, cz, vx, y0 + 3, vz, 'gold');
+  // houses around the well on the same level
+  const spots = [[-12, -5], [6, -5], [-12, 6], [6, 6], [-3, -16], [-3, 12]];
+  for (let i = 0; i < spots.length; i++) {
+    const w = 6 + Math.floor(hash2(vx + i, vz) * 3);
+    const d = 6 + Math.floor(hash2(vx, vz + i) * 3);
+    buildHouse(ch, cx, cz, vx + spots[i][0], vz + spots[i][1], w, d, 4, y0);
+  }
+  // paths
+  for (let i = -16; i <= 16; i++) {
+    put(ch, cx, cz, vx + i, y0 - 1, vz, 'cobble');
+    put(ch, cx, cz, vx, y0 - 1, vz + i, 'cobble');
+  }
+}
+
+function buildTemple(ch, cx, cz, tx, tz) {
+  const y0 = heightAt(tx, tz) + 1;
+  const R = 9;
+  // stepped base
+  for (let step = 0; step < 4; step++) {
+    const r = R - step;
+    for (let dx = -r; dx <= r; dx++) for (let dz = -r; dz <= r; dz++) {
+      put(ch, cx, cz, tx + dx, y0 + step - 1, tz + dz, 'stone');
+      put(ch, cx, cz, tx + dx, y0 + step, tz + dz, 'stone');
+    }
+  }
+  // pillars and a roof on top of the steps
+  const top = y0 + 4;
+  for (const [px, pz] of [[-4, -4], [4, -4], [-4, 4], [4, 4], [0, -4], [0, 4], [-4, 0], [4, 0]]) {
+    for (let y = 0; y < 6; y++) put(ch, cx, cz, tx + px, top + y, tz + pz, 'brick');
+  }
+  for (let dx = -5; dx <= 5; dx++) for (let dz = -5; dz <= 5; dz++) {
+    put(ch, cx, cz, tx + dx, top + 6, tz + dz, 'stone');
+  }
+  // a gold block on the altar
+  put(ch, cx, cz, tx, top, tz, 'gold');
+  put(ch, cx, cz, tx, top + 1, tz, 'gold');
+}
+
+function buildTree(ch, cx, cz, x, z, gy) {
+  const base = gy + 1;
+  const h = 4 + Math.floor(hash2(x, z) * 3);
+  for (let y = 0; y < h; y++) put(ch, cx, cz, x, base + y, z, 'wood');
+  for (let dx = -2; dx <= 2; dx++) for (let dz = -2; dz <= 2; dz++) for (let dy = h - 2; dy <= h + 1; dy++) {
+    const dist = Math.abs(dx) + Math.abs(dz) + Math.abs(dy - h) ;
+    if (dist <= 3 && !(dx === 0 && dz === 0 && dy < h)) put(ch, cx, cz, x + dx, base + dy, z + dz, 'leaf');
+  }
+}
+
+// =====================================================
+// CHUNK GENERATION
+// =====================================================
+function generateChunk(cx, cz) {
+  const ch = { data: new Uint8Array(CHUNK * CHUNK * MAX_H), mesh: null, dirty: true };
+  chunks.set(cKey(cx, cz), ch);
+  const x0 = cx * CHUNK, z0 = cz * CHUNK;
+
+  // 1. Terrain columns
+  for (let lx = 0; lx < CHUNK; lx++) {
+    for (let lz = 0; lz < CHUNK; lz++) {
+      const x = x0 + lx, z = z0 + lz;
+      if (!inWorld(x, z)) continue;
+      const h = heightAt(x, z);
+      for (let y = 0; y <= Math.max(h, SEA); y++) {
+        let name;
+        if (y > h) name = 'water';
+        else if (y === h) name = h <= SEA + 1 ? 'sand' : (h > 22 ? 'snow' : 'grass');
+        else if (y > h - 3) name = h <= SEA + 1 ? 'sand' : 'dirt';
+        else name = 'stone';
+        ch.data[(y * CHUNK + lz) * CHUNK + lx] = ID[name];
+      }
+    }
+  }
+
+  // 2. Structures from the nearby cells (villages and temples can overlap chunk borders)
+  const cellX0 = Math.floor((x0 - 24) / CELL), cellX1 = Math.floor((x0 + CHUNK + 24) / CELL);
+  const cellZ0 = Math.floor((z0 - 24) / CELL), cellZ1 = Math.floor((z0 + CHUNK + 24) / CELL);
+  for (let ccx = cellX0; ccx <= cellX1; ccx++) {
+    for (let ccz = cellZ0; ccz <= cellZ1; ccz++) {
+      const info = cellInfo(ccx, ccz);
+      // keep structures away from the spawn platform and out of water
+      if (info.village && Math.abs(info.village.x) + Math.abs(info.village.z) > 40 && heightAt(info.village.x, info.village.z) > SEA + 2 && Math.abs(info.village.x) < WORLD_LIMIT - 30 && Math.abs(info.village.z) < WORLD_LIMIT - 30)
+        buildVillage(ch, cx, cz, info.village.x, info.village.z);
+      if (info.temple && Math.abs(info.temple.x) + Math.abs(info.temple.z) > 40 && heightAt(info.temple.x, info.temple.z) > SEA + 2 && Math.abs(info.temple.x) < WORLD_LIMIT - 30 && Math.abs(info.temple.z) < WORLD_LIMIT - 30)
+        buildTemple(ch, cx, cz, info.temple.x, info.temple.z);
+    }
+  }
+
+  // 3. Trees (only on grass, away from the spawn and from structures)
+  for (let lx = -2; lx < CHUNK + 2; lx++) {
+    for (let lz = -2; lz < CHUNK + 2; lz++) {
+      const x = x0 + lx, z = z0 + lz;
+      if (!inWorld(x, z)) continue;
+      if (hash2(x * 3 + 1, z * 5 + 2) > 0.985) {
+        const gy = heightAt(x, z);
+        if (gy > SEA + 1 && gy <= 22 && Math.abs(x) + Math.abs(z) > 14) {
+          // skip if it would land in a village or temple footprint
+          const info = cellInfo(Math.floor(x / CELL), Math.floor(z / CELL));
+          const nearV = info.village && Math.abs(x - info.village.x) < 22 && Math.abs(z - info.village.z) < 22;
+          const nearT = info.temple && Math.abs(x - info.temple.x) < 12 && Math.abs(z - info.temple.z) < 12;
+          if (!nearV && !nearT) buildTree(ch, cx, cz, x, z, gy);
+        }
+      }
+    }
+  }
+
+  // 4. Spawn platform at 0,0 (unbreakable)
+  if (cx === 0 || cx === -1 || cz === 0 || cz === -1) {
+    const py = SPAWN_Y - 1;
+    for (let dx = -4; dx <= 4; dx++) for (let dz = -4; dz <= 4; dz++) {
+      setBlockRaw(ch, cx, cz, dx, py, dz, ID.platform);
+      // clear headroom and anything poking through
+      for (let y = py + 1; y < py + 8; y++) setBlockRaw(ch, cx, cz, dx, y, dz, 0);
+    }
+  }
+}
+
+const SPAWN_Y = Math.max(heightAt(0, 0), SEA) + 3;
+
+// =====================================================
+// CHUNK MESHING (only draws faces that touch air)
+// =====================================================
+const FACES = [
+  { dir: [ 1, 0, 0], v: [[1,0,1],[1,0,0],[1,1,0],[1,1,1]] },
+  { dir: [-1, 0, 0], v: [[0,0,0],[0,0,1],[0,1,1],[0,1,0]] },
+  { dir: [0,  1, 0], v: [[0,1,1],[1,1,1],[1,1,0],[0,1,0]] },
+  { dir: [0, -1, 0], v: [[0,0,0],[1,0,0],[1,0,1],[0,0,1]] },
+  { dir: [0, 0,  1], v: [[0,0,1],[1,0,1],[1,1,1],[0,1,1]] },
+  { dir: [0, 0, -1], v: [[1,0,0],[0,0,0],[0,1,0],[1,1,0]] }
+];
+const UV = [[0,0],[1,0],[1,1],[0,1]];
+
+function isOpaque(id) { return id !== 0 && NAMES[id] !== 'glass' && NAMES[id] !== 'water'; }
+
+function buildChunkMesh(cx, cz) {
+  const ch = getChunk(cx, cz);
+  if (!ch) return;
+  if (ch.mesh) { scene.remove(ch.mesh); ch.mesh.children.forEach(m => m.geometry.dispose()); }
+  const group = new THREE.Group();
+  const buckets = {};   // block id -> { pos, uv, norm, idx }
+  const x0 = cx * CHUNK, z0 = cz * CHUNK;
+
+  for (let y = 0; y < MAX_H; y++) {
+    for (let lz = 0; lz < CHUNK; lz++) {
+      for (let lx = 0; lx < CHUNK; lx++) {
+        const id = ch.data[(y * CHUNK + lz) * CHUNK + lx];
+        if (!id) continue;
+        const x = x0 + lx, z = z0 + lz;
+        for (const f of FACES) {
+          const nid = getBlock(x + f.dir[0], y + f.dir[1], z + f.dir[2]);
+          // draw this face if the neighbour is air, or see-through and not the same block
+          const show = nid === 0 || (!isOpaque(nid) && nid !== id);
+          if (!show) continue;
+          let b = buckets[id];
+          if (!b) b = buckets[id] = { pos: [], uv: [], norm: [], idx: [] };
+          const start = b.pos.length / 3;
+          for (let i = 0; i < 4; i++) {
+            b.pos.push(x + f.v[i][0], y + f.v[i][1], z + f.v[i][2]);
+            b.norm.push(f.dir[0], f.dir[1], f.dir[2]);
+            b.uv.push(UV[i][0], UV[i][1]);
+          }
+          b.idx.push(start, start + 1, start + 2, start, start + 2, start + 3);
+        }
+      }
+    }
+  }
+
+  for (const id in buckets) {
+    const b = buckets[id];
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(b.pos, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(b.norm, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(b.uv, 2));
+    g.setIndex(b.idx);
+    group.add(new THREE.Mesh(g, mats[id]));
+  }
+  ch.mesh = group;
+  ch.dirty = false;
+  scene.add(group);
+}
+
+// =====================================================
+// CHUNK STREAMING (load near you, unload far away)
+// =====================================================
+let lastCx = 1e9, lastCz = 1e9;
+const buildQueue = [];
+
+function updateChunks() {
+  const px = Math.floor(rig.position.x), pz = Math.floor(rig.position.z);
+  const pcx = Math.floor(px / CHUNK), pcz = Math.floor(pz / CHUNK);
+  if (pcx !== lastCx || pcz !== lastCz) {
+    lastCx = pcx; lastCz = pcz;
+    const need = new Set();
+    for (let dx = -VIEW_CHUNKS; dx <= VIEW_CHUNKS; dx++) {
+      for (let dz = -VIEW_CHUNKS; dz <= VIEW_CHUNKS; dz++) {
+        const cx = pcx + dx, cz = pcz + dz;
+        if (!inWorld(cx * CHUNK, cz * CHUNK) && !inWorld(cx * CHUNK + CHUNK - 1, cz * CHUNK + CHUNK - 1)) continue;
+        need.add(cKey(cx, cz));
+        if (!getChunk(cx, cz)) { generateChunk(cx, cz); buildQueue.push([cx, cz]); }
+      }
+    }
+    // unload chunks that are far away (their edits are lost, fine for a beta)
+    for (const [k, ch] of chunks) {
+      if (!need.has(k)) {
+        if (ch.mesh) { scene.remove(ch.mesh); ch.mesh.children.forEach(m => m.geometry.dispose()); }
+        chunks.delete(k);
+      }
+    }
+  }
+  // build a couple of meshes per frame so the headset never stalls
+  let n = 0;
+  while (buildQueue.length && n < 2) {
+    const [cx, cz] = buildQueue.shift();
+    if (getChunk(cx, cz)) buildChunkMesh(cx, cz);
+    n++;
+  }
+  // rebuild chunks changed by breaking
+  for (const [k, ch] of chunks) {
+    if (ch.dirty && n < 3) { const [cx, cz] = k.split(',').map(Number); buildChunkMesh(cx, cz); n++; }
+  }
+}
+
+// =====================================================
+// BETA SIGN ON THE SPAWN PLATFORM
+// =====================================================
+function makeSign() {
+  const c = document.createElement('canvas');
+  c.width = 512; c.height = 128;
+  const g = c.getContext('2d');
+  g.fillStyle = '#111';
+  g.fillRect(0, 0, 512, 128);
+  g.strokeStyle = '#ffd54a';
+  g.lineWidth = 6;
+  g.strokeRect(4, 4, 504, 120);
+  g.fillStyle = '#ffd54a';
+  g.font = 'bold 64px sans-serif';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.fillText('THIS IS A BETA', 256, 66);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sign = new THREE.Mesh(
+    new THREE.PlaneGeometry(3, 0.75),
+    new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide })
+  );
+  sign.position.set(0.5, SPAWN_Y + 1.6, -3);
+  scene.add(sign);
+}
+makeSign();
+
+// =====================================================
+// START POSITION (exactly 0,0)
+// =====================================================
+const velocity = new THREE.Vector3();
+function startPosition() {
+  rig.position.set(0.5, SPAWN_Y, 0.5);
+  velocity.set(0, 0, 0);
+}
+startPosition();
+
+// =====================================================
+// CONTROLLERS
+// =====================================================
+const controllers = [];
+for (let i = 0; i < 2; i++) {
+  const c = renderer.xr.getController(i);
+  c.userData = { pressed: false, target: null };
+  const tip = new THREE.Mesh(
+    new THREE.BoxGeometry(0.06, 0.06, 0.16),
+    new THREE.MeshBasicMaterial({ color: i === 0 ? 0xffeb3b : 0x4dd0e1 })
+  );
+  tip.position.z = -0.08;
+  c.add(tip);
+  c.addEventListener('selectstart', () => { c.userData.pressed = true; });
+  c.addEventListener('selectend', () => { c.userData.pressed = false; c.userData.target = null; });
+  rig.add(c);
+  controllers.push(c);
+}
+
+// =====================================================
+// BLOCK BREAKING (hold trigger while your hand is in a block)
+// =====================================================
+const CRACK_STAGES = 5;
+const BREAK_SPEED = 1.0;
+const REACH = 0.10;
+const tmp = new THREE.Vector3();
+const tmpQ = new THREE.Quaternion();
+const fwd = new THREE.Vector3();
+
+const crackBox = new THREE.Mesh(
+  new THREE.BoxGeometry(1.02, 1.02, 1.02),
+  new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0, depthWrite: false })
+);
+crackBox.visible = false;
+scene.add(crackBox);
+
+const damage = new Map();    // 'x,y,z' -> { hp }
+const bKey = (x, y, z) => x + ',' + y + ',' + z;
+
+function updateBreaking(dt) {
+  let showing = false;
+  for (const c of controllers) {
+    const u = c.userData;
+    if (!u.pressed) continue;
+    c.getWorldPosition(tmp);
+    c.getWorldQuaternion(tmpQ);
+    fwd.set(0, 0, -1).applyQuaternion(tmpQ);
+    tmp.addScaledVector(fwd, REACH);
+    const bx = Math.floor(tmp.x), by = Math.floor(tmp.y), bz = Math.floor(tmp.z);
+    const id = getBlock(bx, by, bz);
+    const name = NAMES[id];
+    const k = bKey(bx, by, bz);
+
+    if (u.target !== k) {
+      if (u.target) damage.delete(u.target);
+      u.target = k;
+    }
+    if (!id || name === 'water' || TYPES[name].unbreakable) continue;
+
+    let d = damage.get(k);
+    if (!d) { d = { hp: TYPES[name].hp, max: TYPES[name].hp }; damage.set(k, d); }
+    d.hp -= BREAK_SPEED * dt;
+
+    const frac = 1 - d.hp / d.max;
+    const stage = Math.min(CRACK_STAGES - 1, Math.floor(frac * CRACK_STAGES));
+    crackBox.position.set(bx + 0.5, by + 0.5, bz + 0.5);
+    crackBox.material.opacity = 0.12 + stage * 0.12;
+    crackBox.scale.setScalar(1 + (Math.random() - 0.5) * 0.02 * stage);
+    crackBox.visible = true;
+    showing = true;
+
+    const src = c.userData.gamepad;
+    const act = src && src.hapticActuators && src.hapticActuators[0];
+    if (act && act.pulse) act.pulse(0.3, 20);
+
+    if (d.hp <= 0) {
+      setBlock(bx, by, bz, 0);
+      damage.delete(k);
+      u.target = null;
+    }
+  }
+  if (!showing) crackBox.visible = false;
+}
+
+// =====================================================
+// GORILLA TAG MOVEMENT (hands collide with blocks)
+// =====================================================
+const GRAVITY = -9.8;
+const HAND_RADIUS = 0.08;
+const PUSH_BOOST = 1.15;
+const AIR_DRAG = 0.4;
+const MAX_SPEED = 10;
+const prevHand = [new THREE.Vector3(), new THREE.Vector3()];
+const handReady = [false, false];
+const handWorld = new THREE.Vector3();
+const headPos = new THREE.Vector3();
+
+function solidAt(p) {
+  const id = getBlock(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z));
+  return id !== 0 && NAMES[id] !== 'water';
+}
+
+function pushOutDirection(p) {
+  const dx = p.x - (Math.floor(p.x) + 0.5);
+  const dy = p.y - (Math.floor(p.y) + 0.5);
+  const dz = p.z - (Math.floor(p.z) + 0.5);
+  const ax = Math.abs(dx), ay = Math.abs(dy), az = Math.abs(dz);
+  const out = new THREE.Vector3();
+  if (ax >= ay && ax >= az) out.x = Math.sign(dx) || 1;
+  else if (ay >= az) out.y = Math.sign(dy) || 1;
+  else out.z = Math.sign(dz) || 1;
+  return out;
+}
+
+function updateMovement(dt) {
+  const shove = new THREE.Vector3();
+  for (let i = 0; i < 2; i++) {
+    controllers[i].getWorldPosition(handWorld);
+    if (handReady[i]) {
+      const R = HAND_RADIUS;
+      const probes = [[0,0,0],[R,0,0],[-R,0,0],[0,R,0],[0,-R,0],[0,0,R],[0,0,-R]];
+      for (const o of probes) {
+        const probe = handWorld.clone().add(new THREE.Vector3(o[0], o[1], o[2]));
+        if (solidAt(probe)) {
+          const handMove = handWorld.clone().sub(prevHand[i]);
+          const outDir = pushOutDirection(probe);
+          shove.addScaledVector(outDir, 0.02);
+          const hv = handMove.multiplyScalar(-PUSH_BOOST / Math.max(dt, 0.001));
+          const into = hv.dot(outDir);
+          if (into > 0) velocity.addScaledVector(outDir, into);
+          break;
+        }
+      }
+    }
+    prevHand[i].copy(handWorld);
+    handReady[i] = true;
+  }
+  rig.position.add(shove);
+
+  velocity.y += GRAVITY * dt;
+  velocity.multiplyScalar(1 - AIR_DRAG * dt);
+  if (velocity.length() > MAX_SPEED) velocity.setLength(MAX_SPEED);
+
+  // move one axis at a time so you slide along walls and land on floors
+  for (const axis of ['x', 'y', 'z']) {
+    const step = velocity[axis] * dt;
+    rig.position[axis] += step;
+    camera.getWorldPosition(headPos);
+    const checks = [headPos.clone(), headPos.clone().setY(headPos.y - 0.6), headPos.clone().setY(headPos.y - 1.3)];
+    let hit = false;
+    for (const p of checks) if (solidAt(p)) { hit = true; break; }
+    if (hit) { rig.position[axis] -= step; velocity[axis] = 0; }
+  }
+
+  // world edge: an invisible wall at 5,000 blocks
+  rig.position.x = Math.max(-WORLD_LIMIT + 0.5, Math.min(WORLD_LIMIT - 0.5, rig.position.x));
+  rig.position.z = Math.max(-WORLD_LIMIT + 0.5, Math.min(WORLD_LIMIT - 0.5, rig.position.z));
+
+  if (rig.position.y < -20) startPosition();
+}
+
+// =====================================================
+// GAME LOOP
+// =====================================================
+// Make the first chunks before the player appears
+updateChunks();
+for (let n = 0; n < 12 && buildQueue.length; n++) { const [cx, cz] = buildQueue.shift(); buildChunkMesh(cx, cz); }
+
+let last = performance.now();
+renderer.setAnimationLoop(() => {
+  const now = performance.now();
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  updateChunks();
+  updateMovement(dt);
+  updateBreaking(dt);
+  renderer.render(scene, camera);
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
