@@ -535,9 +535,9 @@ function skinTexture(part) {
 // so it is mostly there for looks and for other people later.
 const headPos = new THREE.Vector3();
 const body = new THREE.Group();
-const bodyHead = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.3, 0.3), new THREE.MeshLambertMaterial({ map: skinTexture('head') }));
-const bodyTorso = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.6, 0.2), new THREE.MeshLambertMaterial({ map: skinTexture('torso') }));
-const bodyLegs = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.6, 0.2), new THREE.MeshLambertMaterial({ map: skinTexture('legs') }));
+const bodyHead = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.22, 0.22), new THREE.MeshLambertMaterial({ map: skinTexture('head') }));
+const bodyTorso = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.22, 0.14), new THREE.MeshLambertMaterial({ map: skinTexture('torso') }));
+const bodyLegs = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.2, 0.14), new THREE.MeshLambertMaterial({ map: skinTexture('legs') }));
 bodyHead.visible = false;   // hide your own head so it does not block your view
 body.add(bodyHead, bodyTorso, bodyLegs);
 scene.add(body);
@@ -549,7 +549,7 @@ function updateBody() {
   body.rotation.y = yaw;
   bodyHead.position.y = headPos.y;
   bodyTorso.position.y = headPos.y - 0.2;
-  bodyLegs.position.y = headPos.y - 0.45;
+  bodyLegs.position.y = headPos.y - 0.4;
   // keep the torso a little behind your head so it is not in your face
   bodyTorso.position.z = 0.12;
   bodyLegs.position.z = 0.12;
@@ -653,6 +653,7 @@ const MAX_SPEED = 10;
 const BODY_HEIGHT = 0.45;     // short body: the column from your head down, in metres
 const BODY_RADIUS = 0.12;     // how wide your body is
 const GROUND_FRICTION = 8;    // how fast you stop sliding when your body is on the ground
+const HAND_FRICTION = 14;     // how fast you stop sliding while a hand is touching a block
 const prevHand = [new THREE.Vector3(), new THREE.Vector3()];
 const handWorld = new THREE.Vector3();
 
@@ -675,6 +676,7 @@ function pushOutDirection(p) {
 
 function updateMovement(dt) {
   const shove = new THREE.Vector3();
+  let handTouching = false;
   for (let i = 0; i < 2; i++) {
     if (!controllers[i].userData.connected) { handReady[i] = false; continue; }
     controllers[i].getWorldPosition(handWorld);
@@ -690,6 +692,7 @@ function updateMovement(dt) {
           const hv = handMove.multiplyScalar(-PUSH_BOOST / Math.max(dt, 0.001));
           const into = hv.dot(outDir);
           if (into > 0) velocity.addScaledVector(outDir, into);
+          handTouching = true;
           break;
         }
       }
@@ -698,6 +701,14 @@ function updateMovement(dt) {
     handReady[i] = true;
   }
   rig.position.add(shove);
+
+  // hands resting on a block grip it, so you stop sliding instead of skating
+  if (handTouching) {
+    const grip = Math.max(0, 1 - HAND_FRICTION * dt);
+    velocity.x *= grip;
+    velocity.z *= grip;
+    if (velocity.y > 0) velocity.y *= grip;
+  }
 
   velocity.y += GRAVITY * dt;
   velocity.multiplyScalar(1 - AIR_DRAG * dt);
